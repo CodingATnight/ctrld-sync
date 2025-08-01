@@ -15,7 +15,8 @@ Nothing fancy, just works.
 
 import os
 import logging
-from typing import Dict, List
+import time
+from typing import Dict, List, Optional, Any, Set
 
 import httpx
 from dotenv import load_dotenv
@@ -52,6 +53,9 @@ FOLDER_URLS = [
 ]
 
 BATCH_SIZE = 500
+MAX_RETRIES = 3
+RETRY_DELAY = 1  # seconds
+FOLDER_CREATION_DELAY = 2  # seconds to wait after creating a folder
 
 # --------------------------------------------------------------------------- #
 # 2. Clients
@@ -76,24 +80,41 @@ _cache: Dict[str, Dict] = {}
 
 
 def _api_get(url: str) -> httpx.Response:
-    """GET helper for Control-D API."""
-    r = _api.get(url)
-    r.raise_for_status()
-    return r
+    """GET helper for Control-D API with retries."""
+    return _retry_request(lambda: _api.get(url))
 
 
 def _api_delete(url: str) -> httpx.Response:
-    """DELETE helper for Control-D API."""
-    r = _api.delete(url)
-    r.raise_for_status()
-    return r
+    """DELETE helper for Control-D API with retries."""
+    return _retry_request(lambda: _api.delete(url))
 
 
 def _api_post(url: str, data: Dict) -> httpx.Response:
-    """POST helper for Control-D API."""
-    r = _api.post(url, data=data)
-    r.raise_for_status()
-    return r
+    """POST helper for Control-D API with retries."""
+    return _retry_request(lambda: _api.post(url, data=data))
+
+
+def _api_post_form(url: str, data: Dict) -> httpx.Response:
+    """POST helper for form data with retries."""
+    return _retry_request(lambda: _api.post(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"}))
+
+
+def _retry_request(request_func, max_retries=MAX_RETRIES, delay=RETRY_DELAY):
+    """Retry a request function with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            response = request_func()
+            response.raise_for_status()
+            return response
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            if attempt == max_retries - 1:
+                # Log the response content if available
+                if hasattr(e, 'response') and e.response is not None:
+                    log.error(f"Response content: {e.response.text}")
+                raise
+            wait_time = delay * (2 ** attempt)
+            log.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+            time.sleep(wait_time)
 
 
 def _gh_get(url: str) -> Dict:
@@ -107,42 +128,104 @@ def _gh_get(url: str) -> Dict:
 
 def list_existing_folders(profile_id: str) -> Dict[str, str]:
     """Return folder-name -> folder-id mapping."""
-    data = _api_get(f"{API_BASE}/{profile_id}/groups").json()
-    folders = data.get("body", {}).get("groups", [])
-    return {
-        f["group"].strip(): f["PK"]
-        for f in folders
-        if f.get("group") and f.get("PK")
-    }
+    try:
+        data = _api_get(f"{API_BASE}/{profile_id}/groups").json()
+        folders = data.get("body", {}).get("groups", [])
+        return {
+            f["group"].strip(): f["PK"]
+            for f in folders
+            if f.get("group") and f.get("PK")
+        }
+    except (httpx.HTTPError, KeyError) as e:
+        log.error(f"Failed to list existing folders: {e}")
+        return {}
 
 
-def fetch_folder_name(url: str) -> str:
-    """Return folder name from GitHub JSON."""
-    return _gh_get(url)["group"]["group"].strip()
+def get_all_existing_rules(profile_id: str) -> Set[str]:
+    """Get all existing rules from all folders in the profile."""
+    all_rules = set()
+    
+    try:
+        # Get rules from root folder (no folder_id)
+        try:
+            data = _api_get(f"{API_BASE}/{profile_id}/rules").json()
+            root_rules = data.get("body", {}).get("rules", [])
+            for rule in root_rules:
+                if rule.get("PK"):
+                    all_rules.add(rule["PK"])
+            
+            log.debug(f"Found {len(root_rules)} rules in root folder")
+                
+        except httpx.HTTPError as e:
+            log.warning(f"Failed to get root folder rules: {e}")
+        
+        # Get all folders (including ones we're not managing)
+        folders = list_existing_folders(profile_id)
+        
+        # Get rules from each folder
+        for folder_name, folder_id in folders.items():
+            try:
+                data = _api_get(f"{API_BASE}/{profile_id}/rules/{folder_id}").json()
+                folder_rules = data.get("body", {}).get("rules", [])
+                for rule in folder_rules:
+                    if rule.get("PK"):
+                        all_rules.add(rule["PK"])
+                
+                log.debug(f"Found {len(folder_rules)} rules in folder '{folder_name}'")
+                
+            except httpx.HTTPError as e:
+                log.warning(f"Failed to get rules from folder '{folder_name}': {e}")
+                continue
+        
+        log.info(f"Total existing rules across all folders: {len(all_rules)}")
+        return all_rules
+        
+    except Exception as e:
+        log.error(f"Failed to get existing rules: {e}")
+        return set()
 
 
-def delete_folder(profile_id: str, name: str, folder_id: str) -> None:
-    """Delete a single folder by its ID."""
-    _api_delete(f"{API_BASE}/{profile_id}/groups/{folder_id}")
-    log.info("Deleted folder '%s' (ID %s)", name, folder_id)
+def fetch_folder_data(url: str) -> Dict[str, Any]:
+    """Return folder data from GitHub JSON."""
+    js = _gh_get(url)
+    return js
 
 
-def create_folder(profile_id: str, name: str, do: int, status: int) -> str:
+def delete_folder(profile_id: str, name: str, folder_id: str) -> bool:
+    """Delete a single folder by its ID. Returns True if successful."""
+    try:
+        _api_delete(f"{API_BASE}/{profile_id}/groups/{folder_id}")
+        log.info("Deleted folder '%s' (ID %s)", name, folder_id)
+        return True
+    except httpx.HTTPError as e:
+        log.error(f"Failed to delete folder '{name}' (ID {folder_id}): {e}")
+        return False
+
+
+def create_folder(profile_id: str, name: str, do: int, status: int) -> Optional[str]:
     """
     Create a new folder and return its ID.
     The API returns the full list of groups, so we look for the one we just added.
     """
-    _api_post(
-        f"{API_BASE}/{profile_id}/groups",
-        data={"name": name, "do": do, "status": status},
-    )
-    # Re-fetch the list and pick the folder we just created
-    data = _api_get(f"{API_BASE}/{profile_id}/groups").json()
-    for grp in data["body"]["groups"]:
-        if grp["group"].strip() == name.strip():
-            log.info("Created folder '%s' (ID %s)", name, grp["PK"])
-            return str(grp["PK"])
-    raise RuntimeError(f"Folder '{name}' was not found after creation")
+    try:
+        _api_post(
+            f"{API_BASE}/{profile_id}/groups",
+            data={"name": name, "do": do, "status": status},
+        )
+        
+        # Re-fetch the list and pick the folder we just created
+        data = _api_get(f"{API_BASE}/{profile_id}/groups").json()
+        for grp in data["body"]["groups"]:
+            if grp["group"].strip() == name.strip():
+                log.info("Created folder '%s' (ID %s)", name, grp["PK"])
+                time.sleep(FOLDER_CREATION_DELAY)
+                return str(grp["PK"])
+        
+        log.error(f"Folder '{name}' was not found after creation")
+        return None
+    except (httpx.HTTPError, KeyError) as e:
+        log.error(f"Failed to create folder '{name}': {e}")
+        return None
 
 
 def push_rules(
@@ -152,65 +235,140 @@ def push_rules(
     do: int,
     status: int,
     hostnames: List[str],
-) -> None:
-    """Push hostnames in batches to the given folder."""
-    for i, start in enumerate(range(0, len(hostnames), BATCH_SIZE), 1):
-        batch = hostnames[start : start + BATCH_SIZE]
-        _api_post(
-            f"{API_BASE}/{profile_id}/rules",
-            data={
-                "do": do,
-                "status": status,
-                "group": folder_id,
-                "hostnames[]": batch,
-            },
-        )
-        log.info(
-            "Folder '%s' – batch %d: added %d rules",
-            folder_name,
-            i,
-            len(batch),
-        )
-    log.info("Folder '%s' – finished (%d total rules)", folder_name, len(hostnames))
+    existing_rules: Set[str],
+) -> bool:
+    """Push hostnames in batches to the given folder, skipping duplicates. Returns True if successful."""
+    if not hostnames:
+        log.info("Folder '%s' - no rules to push", folder_name)
+        return True
+    
+    # Filter out duplicates
+    original_count = len(hostnames)
+    filtered_hostnames = [h for h in hostnames if h not in existing_rules]
+    duplicates_count = original_count - len(filtered_hostnames)
+    
+    if duplicates_count > 0:
+        log.info(f"Folder '{folder_name}': skipping {duplicates_count} duplicate rules")
+    
+    if not filtered_hostnames:
+        log.info(f"Folder '{folder_name}' - no new rules to push after filtering duplicates")
+        return True
+    
+    successful_batches = 0
+    total_batches = len(range(0, len(filtered_hostnames), BATCH_SIZE))
+    
+    for i, start in enumerate(range(0, len(filtered_hostnames), BATCH_SIZE), 1):
+        batch = filtered_hostnames[start : start + BATCH_SIZE]
+        
+        data = {
+            "do": str(do),
+            "status": str(status),
+            "group": str(folder_id),
+        }
+        
+        for j, hostname in enumerate(batch):
+            data[f"hostnames[{j}]"] = hostname
+        
+        try:
+            _api_post_form(
+                f"{API_BASE}/{profile_id}/rules",
+                data=data,
+            )
+            log.info(
+                "Folder '%s' – batch %d: added %d rules",
+                folder_name,
+                i,
+                len(batch),
+            )
+            successful_batches += 1
+            
+            # Update existing_rules set with the newly added rules
+            existing_rules.update(batch)
+            
+        except httpx.HTTPError as e:
+            log.error(f"Failed to push batch {i} for folder '{folder_name}': {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                log.error(f"Response content: {e.response.text}")
+    
+    if successful_batches == total_batches:
+        log.info("Folder '%s' – finished (%d new rules added)", folder_name, len(filtered_hostnames))
+        return True
+    else:
+        log.error(f"Folder '%s' – only {successful_batches}/{total_batches} batches succeeded")
+        return False
 
 
 # --------------------------------------------------------------------------- #
 # 4. Main workflow
 # --------------------------------------------------------------------------- #
-def sync_profile(profile_id: str) -> None:
-    """One-shot sync: delete old, create new, push rules."""
-    wanted_names = [fetch_folder_name(u) for u in FOLDER_URLS]
-
-    existing = list_existing_folders(profile_id)
-    for name in wanted_names:
-        if name in existing:
-            delete_folder(profile_id, name, existing[name])
-
-    for url in FOLDER_URLS:
-        js = _gh_get(url)
-        grp = js["group"]
-        folder_name = grp["group"]
-        do = grp["action"]["do"]
-        status = grp["action"]["status"]
-        hostnames = [r["PK"] for r in js.get("rules", []) if r.get("PK")]
-
-        folder_id = create_folder(profile_id, folder_name, do, status)
-        if hostnames:
-            push_rules(profile_id, folder_name, folder_id, do, status, hostnames)
-        else:
-            log.info("Folder '%s' - no rules to push", folder_name)
-
-    log.info("Sync complete ✔")
+def sync_profile(profile_id: str) -> bool:
+    """One-shot sync: delete old, create new, push rules. Returns True if successful."""
+    try:
+        # Fetch all folder data first
+        folder_data_list = []
+        for url in FOLDER_URLS:
+            try:
+                folder_data_list.append(fetch_folder_data(url))
+            except (httpx.HTTPError, KeyError) as e:
+                log.error(f"Failed to fetch folder data from {url}: {e}")
+                continue
+        
+        if not folder_data_list:
+            log.error("No valid folder data found")
+            return False
+        
+        # Get existing folders and delete target folders
+        existing_folders = list_existing_folders(profile_id)
+        for folder_data in folder_data_list:
+            name = folder_data["group"]["group"].strip()
+            if name in existing_folders:
+                delete_folder(profile_id, name, existing_folders[name])
+        
+        # Get all existing rules AFTER deleting target folders
+        existing_rules = get_all_existing_rules(profile_id)
+        
+        # Create new folders and push rules
+        success_count = 0
+        for folder_data in folder_data_list:
+            grp = folder_data["group"]
+            name = grp["group"].strip()
+            do = grp["action"]["do"]
+            status = grp["action"]["status"]
+            hostnames = [r["PK"] for r in folder_data.get("rules", []) if r.get("PK")]
+            
+            folder_id = create_folder(profile_id, name, do, status)
+            if folder_id and push_rules(profile_id, name, folder_id, do, status, hostnames, existing_rules):
+                success_count += 1
+                # Note: existing_rules is updated within push_rules function
+            
+            # Optional: Refresh existing rules after each folder (more thorough but slower)
+            # existing_rules = get_all_existing_rules(profile_id)
+        
+        log.info(f"Sync complete: {success_count}/{len(folder_data_list)} folders processed successfully")
+        return success_count == len(folder_data_list)
+    
+    except Exception as e:
+        log.error(f"Unexpected error during sync for profile {profile_id}: {e}")
+        return False
 
 
 # --------------------------------------------------------------------------- #
 # 5. Entry-point
 # --------------------------------------------------------------------------- #
-if __name__ == "__main__":
+def main():
     if not TOKEN or not PROFILE_IDS:
         log.error("TOKEN and/or PROFILE missing - check your .env file")
         exit(1)
-
+    
+    success_count = 0
     for profile_id in PROFILE_IDS:
         log.info("Starting sync for profile %s", profile_id)
-        sync_profile(profile_id)
+        if sync_profile(profile_id):
+            success_count += 1
+    
+    log.info(f"All profiles processed: {success_count}/{len(PROFILE_IDS)} successful")
+    exit(0 if success_count == len(PROFILE_IDS) else 1)
+
+
+if __name__ == "__main__":
+    main()
